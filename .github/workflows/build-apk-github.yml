@@ -7,6 +7,7 @@ name: build-apk
 # Linux runner patches:
 #   * android/ondevice/build.sh hard-codes the NDK's darwin-x86_64 llvm-strip
 #   * it calls `shasum`, which GitHub's Ubuntu image does not ship
+#   * web upload often strips the execute bit on gradlew
 
 on:
   workflow_dispatch:
@@ -98,6 +99,7 @@ jobs:
         run: |
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/app/local.properties
           cd android/app
+          chmod +x gradlew
 
           MODE="${{ github.event.inputs.mode || 'live' }}"
           echo "Build mode: $MODE"
