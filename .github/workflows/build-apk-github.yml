@@ -1,13 +1,10 @@
 name: build-apk
 
 # Builds the Android APK and uploads it as a workflow artifact.
-# No game code or game data is in the repo or the APK:
-# the pack is still made on the phone from the user's own dump.
+# No game code or game data is in the repo or the APK.
 #
-# Linux runner patches:
-#   * android/ondevice/build.sh hard-codes the NDK's darwin-x86_64 llvm-strip
-#   * it calls `shasum`, which GitHub's Ubuntu image does not ship
-#   * web upload often strips the execute bit on gradlew
+# -PnxLive=true requires a release keystore (NX_SIGN_*). For CI without
+# secrets, use mode=test / mkw, or mode=live-debug (self-signed temp key).
 
 on:
   workflow_dispatch:
@@ -15,12 +12,13 @@ on:
       mode:
         description: 'Build mode'
         required: true
-        default: 'live'
+        default: 'test'
         type: choice
         options:
-          - live   # release: -PnxLive=true (package name from build.gradle)
-          - test   # default test package: dev.nxnative.android
-          - mkw    # Mario Kart World only test package (original lsmsmx behaviour)
+          - test        # default test package: dev.nxnative.android (no signing)
+          - mkw         # Mario Kart World only test package
+          - live-debug  # nxLive behaviour + package name, self-signed temp key
+          - live        # real release: needs repo secrets NX_SIGN_STORE/ALIAS/PASS
   push:
     branches: [ android, main, master ]
 
@@ -87,7 +85,6 @@ jobs:
           exec sha256sum "$@"
           SHIM
           sudo chmod +x /usr/local/bin/shasum
-          # Make llvm-strip path host-agnostic
           sed -i 's|\$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip|\$BIN/llvm-strip|' \
             android/ondevice/build.sh
           grep -n llvm-strip android/ondevice/build.sh
@@ -96,35 +93,72 @@ jobs:
         run: zsh android/ondevice/build.sh "$RUNNER_TEMP/packer"
 
       - name: APK
+        env:
+          # Optional real release secrets (Settings → Secrets and variables → Actions)
+          NX_SIGN_STORE: ${{ secrets.NX_SIGN_STORE }}
+          NX_SIGN_ALIAS: ${{ secrets.NX_SIGN_ALIAS }}
+          NX_SIGN_PASS: ${{ secrets.NX_SIGN_PASS }}
         run: |
+          set -e
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/app/local.properties
           cd android/app
           chmod +x gradlew
 
-          MODE="${{ github.event.inputs.mode || 'live' }}"
+          MODE="${{ github.event.inputs.mode || 'test' }}"
           echo "Build mode: $MODE"
 
           case "$MODE" in
-            live)
-              # Release: all games + nxLive (package name from build.gradle applicationId)
-              ./gradlew --no-daemon \
-                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
-                -PnxLive=true \
-                apk
-              ;;
             test)
-              # Default test package
               ./gradlew --no-daemon \
                 -PnxPackStage="$RUNNER_TEMP/packer/stage" \
                 apk
               ;;
             mkw)
-              # MKW-only test package (original lsmsmx behaviour)
               ./gradlew --no-daemon \
                 -PnxPackStage="$RUNNER_TEMP/packer/stage" \
                 -PnxGames=0400C3F00006E000 \
                 -PnxApp=mkw \
                 apk
+              ;;
+            live-debug)
+              # Self-signed key so -PnxLive=true works without your real keystore
+              KEYSTORE="$RUNNER_TEMP/debug-release.jks"
+              keytool -genkeypair -v \
+                -keystore "$KEYSTORE" \
+                -storepass android \
+                -keypass android \
+                -alias androiddebugkey \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=BananaNative CI, O=CI, C=US"
+              export NX_SIGN_STORE="$KEYSTORE"
+              export NX_SIGN_ALIAS=androiddebugkey
+              export NX_SIGN_PASS=android
+              ./gradlew --no-daemon \
+                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
+                -PnxLive=true \
+                apk
+              ;;
+            live)
+              if [ -z "$NX_SIGN_STORE" ] || [ -z "$NX_SIGN_ALIAS" ] || [ -z "$NX_SIGN_PASS" ]; then
+                echo "mode=live needs repo secrets: NX_SIGN_STORE, NX_SIGN_ALIAS, NX_SIGN_PASS"
+                echo "Use mode=test, mkw, or live-debug instead."
+                exit 1
+              fi
+              # If the secret is base64 of the keystore file, decode it
+              if [ ! -f "$NX_SIGN_STORE" ]; then
+                echo "$NX_SIGN_STORE" | base64 -d > "$RUNNER_TEMP/release.jks" 2>/dev/null || true
+                if [ -s "$RUNNER_TEMP/release.jks" ]; then
+                  export NX_SIGN_STORE="$RUNNER_TEMP/release.jks"
+                fi
+              fi
+              ./gradlew --no-daemon \
+                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
+                -PnxLive=true \
+                apk
+              ;;
+            *)
+              echo "Unknown mode: $MODE"
+              exit 1
               ;;
           esac
 
