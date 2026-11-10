@@ -1,26 +1,16 @@
 name: build-apk
 
-# Builds the Android APK and uploads it as a workflow artifact.
-# No game code or game data is in the repo or the APK.
-#
-# -PnxLive=true requires a release keystore (NX_SIGN_*). For CI without
-# secrets, use mode=test / mkw, or mode=live-debug (self-signed temp key).
+# 仅手动触发。打出 APK 后自行签名。
+# 包名由 android/app/build.gradle 的 applicationId 决定（请改成 com.andromeda.androbench2）。
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Build mode'
-        required: true
-        default: 'test'
-        type: choice
-        options:
-          - test        # default test package: dev.nxnative.android (no signing)
-          - mkw         # Mario Kart World only test package
-          - live-debug  # nxLive behaviour + package name, self-signed temp key
-          - live        # real release: needs repo secrets NX_SIGN_STORE/ALIAS/PASS
-  push:
-    branches: [ android, main, master ]
+      games:
+        description: '游戏列表（逗号分隔 title ID，留空=全部）'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -92,77 +82,32 @@ jobs:
       - name: Packer stage (CPython, capstone, lz4, translator, SPIRV-Tools)
         run: zsh android/ondevice/build.sh "$RUNNER_TEMP/packer"
 
-      - name: APK
-        env:
-          # Optional real release secrets (Settings → Secrets and variables → Actions)
-          NX_SIGN_STORE: ${{ secrets.NX_SIGN_STORE }}
-          NX_SIGN_ALIAS: ${{ secrets.NX_SIGN_ALIAS }}
-          NX_SIGN_PASS: ${{ secrets.NX_SIGN_PASS }}
+      - name: APK (unsigned / debug-signed; you re-sign offline)
         run: |
           set -e
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/app/local.properties
           cd android/app
           chmod +x gradlew
 
-          MODE="${{ github.event.inputs.mode || 'test' }}"
-          echo "Build mode: $MODE"
+          EXTRA=()
+          GAMES="${{ github.event.inputs.games }}"
+          if [ -n "$GAMES" ]; then
+            EXTRA+=(-PnxGames="$GAMES")
+            echo "Games: $GAMES"
+          else
+            echo "Games: all (from gradle.properties)"
+          fi
 
-          case "$MODE" in
-            test)
-              ./gradlew --no-daemon \
-                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
-                apk
-              ;;
-            mkw)
-              ./gradlew --no-daemon \
-                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
-                -PnxGames=0400C3F00006E000 \
-                -PnxApp=mkw \
-                apk
-              ;;
-            live-debug)
-              # Self-signed key so -PnxLive=true works without your real keystore
-              KEYSTORE="$RUNNER_TEMP/debug-release.jks"
-              keytool -genkeypair -v \
-                -keystore "$KEYSTORE" \
-                -storepass android \
-                -keypass android \
-                -alias androiddebugkey \
-                -keyalg RSA -keysize 2048 -validity 10000 \
-                -dname "CN=BananaNative CI, O=CI, C=US"
-              export NX_SIGN_STORE="$KEYSTORE"
-              export NX_SIGN_ALIAS=androiddebugkey
-              export NX_SIGN_PASS=android
-              ./gradlew --no-daemon \
-                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
-                -PnxLive=true \
-                apk
-              ;;
-            live)
-              if [ -z "$NX_SIGN_STORE" ] || [ -z "$NX_SIGN_ALIAS" ] || [ -z "$NX_SIGN_PASS" ]; then
-                echo "mode=live needs repo secrets: NX_SIGN_STORE, NX_SIGN_ALIAS, NX_SIGN_PASS"
-                echo "Use mode=test, mkw, or live-debug instead."
-                exit 1
-              fi
-              # If the secret is base64 of the keystore file, decode it
-              if [ ! -f "$NX_SIGN_STORE" ]; then
-                echo "$NX_SIGN_STORE" | base64 -d > "$RUNNER_TEMP/release.jks" 2>/dev/null || true
-                if [ -s "$RUNNER_TEMP/release.jks" ]; then
-                  export NX_SIGN_STORE="$RUNNER_TEMP/release.jks"
-                fi
-              fi
-              ./gradlew --no-daemon \
-                -PnxPackStage="$RUNNER_TEMP/packer/stage" \
-                -PnxLive=true \
-                apk
-              ;;
-            *)
-              echo "Unknown mode: $MODE"
-              exit 1
-              ;;
-          esac
+          # 不使用 -PnxLive，避免强制正式签名；包名请在 build.gradle 里改成 com.andromeda.androbench2
+          ./gradlew --no-daemon \
+            -PnxPackStage="$RUNNER_TEMP/packer/stage" \
+            "${EXTRA[@]}" \
+            apk
 
           ls -la out/
+          echo "----"
+          echo "APK is debug-signed. Re-sign offline with your own key, e.g.:"
+          echo "  apksigner sign --ks your.keystore --out banana-signed.apk out/*.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
